@@ -1,83 +1,134 @@
 import os
+import json
 import uvicorn
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
-from mcp.server.fastmcp import FastMCP
-from mcp.server.sse import SseServerTransport
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 
 port = int(os.environ.get("PORT", 10000))
+app = FastAPI(title="Colab MCP Bridge")
 
-# 1. MCP Tanımı
-mcp = FastMCP("ColabBridge")
+# Spark / Gemini'nin tanıyacağı araç listesi
+TOOLS_DEFINITION = [
+    {
+        "name": "whisper_transcribe",
+        "description": "Google Drive üzerindeki ses/video dosyasını GPU kullanarak metne dönüştürür (Whisper).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dosya_adi": {
+                    "type": "string",
+                    "description": "Drive içindeki ses dosyasının tam adı (örn: kayit.mp3)"
+                }
+            },
+            "required": ["dosya_adi"]
+        }
+    }
+]
 
-@mcp.tool()
-def whisper_transcribe(dosya_adi: str) -> str:
-    """Google Drive uzerindeki ses dosyasini transkript eder."""
-    return f"'{dosya_adi}' dosyasi icin Whisper islemi tetiklendi."
+# 1. Kök Dizin Kontrolleri
+@app.get("/")
+@app.head("/")
+async def root():
+    return {"status": "ok", "service": "Colab MCP Bridge"}
 
-# Standart SSE Transport
-sse = SseServerTransport("/messages/")
+# 2. SSE Dinleme Kanalı (GET & HEAD)
+@app.head("/sse")
+async def sse_head():
+    return Response(status_code=200)
 
-async def handle_sse(request):
-    async with sse.connect_sse(
-        request.scope, request.receive, request._send
-    ) as (read_stream, write_stream):
-        await mcp._mcp_server.run(
-            read_stream,
-            write_stream,
-            mcp._mcp_server.create_initialization_options()
-        )
+@app.get("/sse")
+async def sse_stream(request: Request):
+    async def event_generator():
+        # MCP SSE protokolü: Spark'a mesaj gönderebileceği uç noktayı bildir
+        yield f"event: endpoint\ndata: /sse\n\n"
+        # Bağlantıyı canlı tutan periyodik ping
+        while True:
+            if await request.is_disconnected():
+                break
+            yield ": ping\n\n"
+            import asyncio
+            await asyncio.sleep(15)
 
-# Spark hem /messages/ hem de dogrudan /sse adresine POST atabilir
-async def handle_post_message(request):
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
-async def sse_endpoint_router(request):
-    if request.method == "POST":
-        return await handle_post_message(request)
-    elif request.method == "HEAD":
+# 3. Spark'ın El Sıkışma ve Araç İstekleri (POST /sse)
+@app.post("/sse")
+@app.post("/messages/")
+async def handle_mcp_rpc(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
         return Response(status_code=200)
-    else:
-        return await handle_sse(request)
 
-async def health_check(request):
-    if request.method == "HEAD":
-        return Response(status_code=200)
-    return JSONResponse({"status": "ok", "service": "Colab-MCP Server"})
+    method = data.get("method")
+    req_id = data.get("id")
 
-# OAuth kontrollerine Spark'i bekletmeden bos onay don
-async def oauth_dummy(request):
+    # MCP Protokolü El Sıkışması
+    if method == "initialize":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "colab-mcp-bridge",
+                    "version": "1.0.0"
+                }
+            }
+        })
+
+    # Spark'ın araçları listeleme isteği
+    elif method == "tools/list":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": TOOLS_DEFINITION
+            }
+        })
+
+    # Spark'ın aracı çalıştırma isteği
+    elif method == "tools/call":
+        params = data.get("params", {})
+        tool_name = params.get("name")
+        args = params.get("arguments", {})
+
+        if tool_name == "whisper_transcribe":
+            dosya = args.get("dosya_adi", "belirtilmedi")
+            result_text = f"'{dosya}' dosyası Colab GPU kuyruğuna alındı ve işleme başlandı."
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {"type": "text", "text": result_text}
+                    ]
+                }
+            })
+
+    # Diğer tüm bildirimler / kontroller
+    return JSONResponse({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {}
+    })
+
+# 4. OAuth yoklama rotaları (Spark bazen 404 görünce huysuzlaşır)
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/sse")
+async def oauth_dummy():
     return JSONResponse({"status": "unprotected"})
-
-starlette_app = Starlette(
-    routes=[
-        Route("/", endpoint=health_check, methods=["GET", "HEAD"]),
-        Route("/sse", endpoint=sse_endpoint_router, methods=["GET", "HEAD", "POST"]),
-        Route("/messages/", endpoint=handle_post_message, methods=["POST"]),
-        Route("/.well-known/oauth-protected-resource", endpoint=oauth_dummy, methods=["GET"]),
-        Route("/.well-known/oauth-protected-resource/sse", endpoint=oauth_dummy, methods=["GET"]),
-    ]
-)
-
-# 421 Host Dogrulama engelini asan ara katman
-class HostRewriteMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] in ("http", "websocket"):
-            headers = []
-            for name, value in scope.get("headers", []):
-                if name.lower() == b"host":
-                    # Kutuphanenin bekledigi yerel hosta cevir
-                    headers.append((b"host", b"localhost:10000"))
-                else:
-                    headers.append((name, value))
-            scope["headers"] = headers
-        await self.app(scope, receive, send)
-
-app = HostRewriteMiddleware(starlette_app)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=port)
