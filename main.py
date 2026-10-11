@@ -1,14 +1,12 @@
 import os
 import uvicorn
-from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from mcp.server.fastmcp import FastMCP
-from mcp.server.sse import SseServerTransport
 
 port = int(os.environ.get("PORT", 10000))
 
-# MCP Tanımı
+# 1. MCP Tanımı
 mcp = FastMCP("ColabBridge")
 
 @mcp.tool()
@@ -16,36 +14,19 @@ def whisper_transcribe(dosya_adi: str) -> str:
     """Google Drive uzerindeki ses dosyasini transkript eder."""
     return f"'{dosya_adi}' dosyasi icin Whisper islemi tetiklendi."
 
-# Standart SSE Transport
-sse = SseServerTransport("/messages/")
+# 2. FastMCP'nin kendi tam donanimli SSE uygulamasini al
+# Bu uygulama /sse ve /messages rotalarini protokol kurallarina tam uygun sekilde yonetir
+core_app = mcp.sse_app()
 
-async def handle_sse(request):
-    async with sse.connect_sse(
-        request.scope, request.receive, request._send
-    ) as (read_stream, write_stream):
-        await mcp._mcp_server.run(
-            read_stream,
-            write_stream,
-            mcp._mcp_server.create_initialization_options()
-        )
-
-async def handle_messages(request):
-    await sse.handle_post_message(request.scope, request.receive, request._send)
-
+# Google'in kok dizin (/) saglik kontrolleri icin 200 yaniti ekle
 async def health_check(request):
     if request.method == "HEAD":
         return Response(status_code=200)
     return JSONResponse({"status": "ok", "service": "Colab-MCP Server"})
 
-starlette_app = Starlette(
-    routes=[
-        Route("/", endpoint=health_check, methods=["GET", "HEAD"]),
-        Route("/sse", endpoint=handle_sse, methods=["GET"]),
-        Route("/messages/", endpoint=handle_messages, methods=["POST"]),
-    ]
-)
+core_app.routes.insert(0, Route("/", endpoint=health_check, methods=["GET", "HEAD"]))
 
-# Host validation hatasını aşmak için Host başlığını yerel adrese eşleyen ara katman
+# 3. Host Validation (421 Misdirected Request) hatasini onleyen ara katman
 class HostRewriteMiddleware:
     def __init__(self, app):
         self.app = app
@@ -61,7 +42,7 @@ class HostRewriteMiddleware:
             scope["headers"] = headers
         await self.app(scope, receive, send)
 
-app = HostRewriteMiddleware(starlette_app)
+app = HostRewriteMiddleware(core_app)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=port)
