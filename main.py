@@ -4,45 +4,38 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from mcp.server.fastmcp import FastMCP
 
+# DNS Rebinding korumasını bulut sunucuları için yapılandırma
+try:
+    from mcp.server.transport_security import TransportSecuritySettings
+except ImportError:
+    from mcp.server.sse import TransportSecuritySettings
+
 port = int(os.environ.get("PORT", 10000))
 
-# 1. MCP Tanımı
-mcp = FastMCP("ColabBridge")
+# 1. FastMCP nesnesini DNS Rebinding koruması kapalı olarak başlat
+mcp = FastMCP(
+    "ColabBridge",
+    host="0.0.0.0",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    )
+)
 
 @mcp.tool()
 def whisper_transcribe(dosya_adi: str) -> str:
     """Google Drive uzerindeki ses dosyasini transkript eder."""
     return f"'{dosya_adi}' dosyasi icin Whisper islemi tetiklendi."
 
-# 2. FastMCP'nin kendi tam donanimli SSE uygulamasini al
-# Bu uygulama /sse ve /messages rotalarini protokol kurallarina tam uygun sekilde yonetir
-core_app = mcp.sse_app()
+# 2. FastMCP'nin SSE uygulamasını al
+app = mcp.sse_app()
 
-# Google'in kok dizin (/) saglik kontrolleri icin 200 yaniti ekle
+# Google doğrulama kontrolleri için kök dizin rotası
 async def health_check(request):
     if request.method == "HEAD":
         return Response(status_code=200)
     return JSONResponse({"status": "ok", "service": "Colab-MCP Server"})
 
-core_app.routes.insert(0, Route("/", endpoint=health_check, methods=["GET", "HEAD"]))
-
-# 3. Host Validation (421 Misdirected Request) hatasini onleyen ara katman
-class HostRewriteMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] in ("http", "websocket"):
-            headers = []
-            for name, value in scope.get("headers", []):
-                if name.lower() == b"host":
-                    headers.append((b"host", b"localhost"))
-                else:
-                    headers.append((name, value))
-            scope["headers"] = headers
-        await self.app(scope, receive, send)
-
-app = HostRewriteMiddleware(core_app)
+app.routes.insert(0, Route("/", endpoint=health_check, methods=["GET", "HEAD"]))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=port)
